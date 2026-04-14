@@ -1,0 +1,252 @@
+# ppo_env.py —
+import os, sys
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+
+class BatteryFastChargeEnv(gym.Env):
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(self, Q_nom=2.4795, I_max=10.0, soc_target=0.95, dt=1.0):
+        super().__init__()
+        self.Q_nom = Q_nom
+        self.I_max = I_max
+        self.soc_target = soc_target
+        self.dt = dt
+
+        # 电池参数
+        self.R0 = 0.015
+        self.Rp = 0.015
+
+        # 热模型
+        self.T_ambient = 25.0
+        self.T_max = 45.0
+        self.T_target = 30.0
+        self.m_battery = 0.3
+        self.Cp = 1000.0
+        self.C_thermal = self.m_battery * self.Cp
+        self.h_conv = 5.0
+        self.A_surface = 0.02
+
+        # 电压约束
+        self.V_max = 4.2
+        self.V_min = 2.5
+
+        # 观测空间
+        self.observation_space = spaces.Box(
+            low=np.array([0.0, 0.0, 0.0, 0.0, -20.0], dtype=np.float32),
+            high=np.array([1.0, 80.0, I_max, 1.0, 20.0], dtype=np.float32),
+        )
+
+        self.action_space = spaces.Box(
+            low=np.array([0.0], dtype=np.float32),
+            high=np.array([1.0], dtype=np.float32),
+        )
+
+        self.reset()
+
+    def _ocv(self, soc):
+        if soc < 0.1:
+            return 3.0 + 2.0 * soc
+        elif soc < 0.9:
+            return 3.2 + 0.625 * (soc - 0.1)
+        else:
+            return 3.7 + 3.0 * (soc - 0.9)
+
+    def _get_voltage(self, soc, current):
+        return self._ocv(soc) + current * self.R0
+
+    def _update_temp(self, current):
+        Q_gen = (current ** 2) * (self.R0 + self.Rp)
+        Q_loss = self.h_conv * self.A_surface * (self.T_battery - self.T_ambient)
+        dT = (Q_gen - Q_loss) / self.C_thermal * self.dt
+        self.T_battery = float(np.clip(self.T_battery + dT, 0.0, 80.0))
+        self.T_max_reached = max(self.T_max_reached, self.T_battery)
+
+    def _get_obs(self):
+        soc_remain = max(0.0, self.soc_target - self.soc)
+        T_margin = self.T_max - self.T_battery
+        return np.array([
+            self.soc,
+            self.T_battery,
+            self.I_prev,
+            soc_remain,
+            T_margin,
+        ], dtype=np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self.soc = 0.2
+        self.T_battery = self.T_ambient
+        self.I_prev = 0.0
+        self.step_count = 0
+        self.T_max_reached = self.T_ambient
+        self.V_max_reached = self._get_voltage(self.soc, 0.0)
+        self.voltage = self.V_max_reached
+        return self._get_obs(), {}
+
+    def step(self, action):
+        a = float(np.clip(action[0], 0.0, 1.0))
+        I = a * self.I_max
+        soc_old = self.soc
+
+        # 物理更新
+        delta_soc = I * self.dt / (self.Q_nom * 3600.0)
+        self.soc = float(np.clip(self.soc + delta_soc, 0.0, 1.0))
+        self.voltage = self._get_voltage(self.soc, I)
+        self.V_max_reached = max(self.V_max_reached, self.voltage)
+        self._update_temp(I)
+
+        # 奖励计算
+        soc_progress = self.soc - soc_old
+        r_progress = soc_progress * 10000.0
+        r_time = -3.0
+
+        temp_rise = self.T_battery - self.T_ambient
+        if temp_rise <= 3.0:
+            r_temp = 5.0
+        elif temp_rise <= 5.0:
+            r_temp = 10.0
+        elif temp_rise <= 8.0:
+            r_temp = -10.0
+        elif temp_rise <= 12.0:
+            r_temp = -50.0
+        else:
+            r_temp = -200.0
+
+        # 电流策略奖励
+        if self.soc < 0.5:
+            if I >= 8.0:
+                r_current = 15.0
+            elif I >= 5.0:
+                r_current = 5.0
+            elif I >= 2.0:
+                r_current = -20.0
+            else:
+                r_current = -100.0
+        elif self.soc < 0.7:
+            if 6.0 <= I <= 8.5:
+                r_current = 12.0
+            elif I > 8.5:
+                r_current = 5.0
+            elif I >= 3.0:
+                r_current = -10.0
+            else:
+                r_current = -80.0
+        elif self.soc < 0.85:
+            if 3.0 <= I <= 6.0:
+                r_current = 10.0
+            elif I > 6.0:
+                r_current = -20.0
+            elif I >= 1.0:
+                r_current = -15.0
+            else:
+                r_current = -60.0
+        else:
+            if 1.5 <= I <= 3.5:
+                r_current = 8.0
+            elif I > 3.5:
+                r_current = -30.0
+            elif I >= 0.5:
+                r_current = -10.0
+            else:
+                r_current = -50.0
+
+        r_smooth = -5.0 if abs(I - self.I_prev) > 2.0 else 0.0
+        reward = r_progress + r_time + r_temp + r_current + r_smooth
+
+        # 约束检查
+        v_fail = (self.voltage > self.V_max + 0.1) or (self.voltage < self.V_min)
+        temp_fail = self.T_battery > self.T_max
+
+        if v_fail:
+            reward -= 20000.0
+        if temp_fail:
+            reward -= 30000.0
+
+        terminated = self.soc >= self.soc_target
+        truncated = (self.step_count >= 9999) or v_fail or temp_fail
+
+        if terminated:
+            reward += 100000.0
+
+            t = self.step_count
+            if 1500 <= t <= 2000:
+                reward += 50000.0
+                tag_t = "🎯完美时间"
+            elif 1200 <= t < 1500:
+                reward += 30000.0
+                tag_t = "⚡ 稍快"
+            elif 2000 < t <= 2500:
+                reward += 20000.0
+                tag_t = "⏱️  稍慢"
+            elif t < 1200:
+                reward += 10000.0
+                tag_t = "🔥 过快"
+            else:
+                reward -= 10000.0
+                tag_t = "❌ 过慢"
+
+            tr = self.T_max_reached - self.T_ambient
+            if tr <= 5.0:
+                reward += 50000.0
+                tag_T = "🌡️  完美温控"
+            elif tr <= 8.0:
+                reward += 25000.0
+                tag_T = "🌡️  良好温控"
+            elif tr <= 12.0:
+                reward += 5000.0
+                tag_T = "⚠️  温升偏高"
+            else:
+                reward -= 20000.0
+                tag_T = "🔥 超温！"
+
+            print(f"\n{'='*55}")
+            print(f"✅ 充电成功！")
+            print(f"   ⏱️  时间  : {t}s ({t/60:.1f}min) {tag_t}")
+            print(f"   🌡️  温升  : {tr:.2f}°C ({self.T_ambient:.1f}→{self.T_max_reached:.1f}°C)  {tag_T}")
+            print(f"   ⚡ 最高V : {self.V_max_reached:.3f}V")
+            print(f"   🎁 总奖励: {reward:.0f}")
+            print(f"{'='*55}\n")
+
+        elif truncated:
+            soc_remain = self.soc_target - self.soc
+            reward -= 50000.0 + soc_remain * 100000.0
+            if v_fail:
+                print(f"❌ 电压越限终止: V={self.voltage:.2f}V, step={self.step_count}")
+            elif temp_fail:
+                print(f"❌ 温度越限终止: T={self.T_battery:.1f}°C, step={self.step_count}")
+            else:
+                print(f"❌ 超时终止: SOC={self.soc:.3f}, step={self.step_count}")
+
+        self.step_count += 1
+        self.I_prev = I
+
+        return self._get_obs(), reward, terminated, truncated, {}
+
+    def render(self):
+        print(f"[{self.step_count:5d}] SOC={self.soc:.3f} "
+              f"T={self.T_battery:.2f}°C I={self.I_prev:.2f}A V={self.voltage:.3f}V")
+
+    def close(self):
+        pass
+
+
+
+if __name__ == "__main__":
+    env = BatteryFastChargeEnv()
+    obs, _ = env.reset()
+    print("✔ ppo_env.py 语法验证通过！开始恒流充电测试...")
+
+    for i in range(0, 3000, 200):
+        obs, r, done, truncated, _ = env.step(np.array([0.8]))  # 8A
+        print(f"step={env.step_count:4d} | SOC={env.soc:.3f} | "
+              f"T={env.T_battery:.2f}°C")
+        if done or truncated:
+            break
+    env.close()
+    print("✅ 验证完成，无 SyntaxError")
