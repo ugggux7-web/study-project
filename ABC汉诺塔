@@ -1,0 +1,25 @@
+# include<iostream>
+using namespace std;
+void move(int n, char a, char c)
+{
+	cout << "(第" << n << "个盘子从" << a << "移动到" << c << ")" << endl;
+}
+void fanfa(int n, char A, char B, char C)
+{
+	if (n == 1)
+		move(1, A, C);
+	else {
+		fanfa(n - 1, A, C, B);
+		move(n, A, C);
+		fanfa(n - 1, B, A, C);
+	}
+}
+int main()
+{
+	int number;
+	cout << "输入盘子总数";
+	cin >> number;
+
+	fanfa(number, 'A', 'B', 'C');
+}
+
